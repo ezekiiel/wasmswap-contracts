@@ -65,6 +65,35 @@ pub enum ExecuteMsg {
         protocol_fee_percent: Decimal,
         protocol_fee_recipient: String,
     },
+
+    Loan {
+        receiver: String,
+        amount: Uint128,
+        token: TokenSelect,
+    },
+
+    /// Callback messages that may only be executed by the contract
+    /// itself.
+    Callback(CallbackMsg),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CallbackMsg {
+    /// Checks that the contract's TOKEN balance is AMOUNT, errors
+    /// with `ContractError::WrongBalance` if not. Callable only by
+    /// the contract itself.
+    AssertBalance { amount: Uint128, token: TokenSelect },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LoanMsg {
+    /// Executed on contracts when they receive a loan. For a cw20
+    /// denom this will be the `msg` field of a cw20 send message. For
+    /// a native denoms this message will be executed directly on the
+    /// contract.
+    ReceiveLoan { amount: Uint128, denom: Denom },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]

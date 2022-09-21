@@ -69,4 +69,7 @@ pub enum ContractError {
 
     #[error("Failed to instantiate lp token")]
     InstantiateLpTokenError {},
+
+    #[error("The contract's balance was different than expected")]
+    WrongBalance {},
 }

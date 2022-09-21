@@ -1,7 +1,7 @@
 use cosmwasm_std::{
-    attr, entry_point, to_binary, Addr, Binary, BlockInfo, Coin, CosmosMsg, Decimal, Deps, DepsMut,
-    Env, MessageInfo, Reply, Response, StdError, StdResult, SubMsg, Uint128, Uint256, Uint512,
-    WasmMsg,
+    attr, coins, entry_point, to_binary, Addr, Binary, BlockInfo, Coin, CosmosMsg, Decimal, Deps,
+    DepsMut, Env, MessageInfo, Reply, Response, StdError, StdResult, SubMsg, Uint128, Uint256,
+    Uint512, WasmMsg,
 };
 use cw0::parse_reply_instantiate_data;
 use cw2::set_contract_version;
@@ -13,8 +13,8 @@ use std::str::FromStr;
 
 use crate::error::ContractError;
 use crate::msg::{
-    ExecuteMsg, InfoResponse, InstantiateMsg, MigrateMsg, QueryMsg, Token1ForToken2PriceResponse,
-    Token2ForToken1PriceResponse, TokenSelect,
+    CallbackMsg, ExecuteMsg, InfoResponse, InstantiateMsg, LoanMsg, MigrateMsg, QueryMsg,
+    Token1ForToken2PriceResponse, Token2ForToken1PriceResponse, TokenSelect,
 };
 use crate::state::{Fees, Token, FEES, LP_TOKEN, OWNER, TOKEN1, TOKEN2};
 
@@ -185,6 +185,25 @@ pub fn execute(
             protocol_fee_percent,
             protocol_fee_recipient,
         ),
+        ExecuteMsg::Loan {
+            receiver,
+            amount,
+            token,
+        } => execute_loan(deps.as_ref(), env, receiver, amount, token),
+        ExecuteMsg::Callback(msg) => execute_callback(deps, env, info, msg),
+    }
+}
+
+pub fn execute_callback(
+    deps: DepsMut,
+    env: Env,
+    _info: MessageInfo,
+    msg: CallbackMsg,
+) -> Result<Response, ContractError> {
+    match msg {
+        CallbackMsg::AssertBalance { amount, token } => {
+            execute_assert_balance(deps.as_ref(), env, token, amount)
+        }
     }
 }
 
@@ -905,6 +924,105 @@ pub fn execute_pass_through_swap(
         attr("input_token_amount", input_token_amount),
         attr("native_transferred", amount_to_transfer),
     ]))
+}
+
+fn query_denom_balance(deps: Deps, env: &Env, denom: &Denom) -> StdResult<Uint128> {
+    Ok(match denom {
+        Denom::Native(native) => {
+            deps.querier
+                .query_balance(&env.contract.address, native)?
+                .amount
+        }
+        Cw20(addr) => {
+            let resp: cw20::BalanceResponse = deps.querier.query_wasm_smart(
+                addr,
+                &cw20::Cw20QueryMsg::Balance {
+                    address: env.contract.address.to_string(),
+                },
+            )?;
+            resp.balance
+        }
+    })
+}
+
+pub fn execute_loan(
+    deps: Deps,
+    env: Env,
+    receiver: String,
+    amount: Uint128,
+    token: TokenSelect,
+) -> Result<Response, ContractError> {
+    let receiver = deps.api.addr_validate(&receiver)?;
+    let denom = match token {
+        TokenSelect::Token1 => TOKEN1,
+        TokenSelect::Token2 => TOKEN2,
+    }
+    .load(deps.storage)?
+    .denom;
+
+    let start_balance = query_denom_balance(deps, &env, &denom)?;
+
+    let execute_msg = match denom {
+        Denom::Native(ref native) => WasmMsg::Execute {
+            contract_addr: receiver.into_string(),
+            funds: coins(amount.u128(), native),
+            msg: to_binary(&LoanMsg::ReceiveLoan { amount, denom })?,
+        },
+        Cw20(ref contract_addr) => WasmMsg::Execute {
+            contract_addr: contract_addr.to_string(),
+            msg: to_binary(&cw20::Cw20ExecuteMsg::Send {
+                contract: receiver.into_string(),
+                amount,
+                msg: to_binary(&LoanMsg::ReceiveLoan { amount, denom })?,
+            })?,
+            funds: vec![],
+        },
+    };
+
+    let fees = FEES.load(deps.storage)?;
+    let fees = fees.lp_fee_percent + fees.protocol_fee_percent;
+
+    // start_balance + amount * (10_000 - 100 * fee) / 10_000
+    let amount_with_fee: Uint128 = amount
+        .full_mul(FEE_SCALE_FACTOR - fee_decimal_to_uint128(fees)?)
+        .checked_div(Uint256::from_uint128(FEE_SCALE_FACTOR))
+        .map_err(StdError::divide_by_zero)?
+        .try_into()
+        .map_err(|err| StdError::ConversionOverflow { source: err })?;
+    let expected = start_balance + amount_with_fee;
+
+    Ok(Response::default()
+        .add_attribute("method", "execute_loan")
+        .add_message(execute_msg)
+        .add_message(WasmMsg::Execute {
+            contract_addr: env.contract.address.into_string(),
+            msg: to_binary(&CallbackMsg::AssertBalance {
+                amount: expected,
+                token,
+            })?,
+            funds: vec![],
+        }))
+}
+
+pub fn execute_assert_balance(
+    deps: Deps,
+    env: Env,
+    token: TokenSelect,
+    expected: Uint128,
+) -> Result<Response, ContractError> {
+    let denom = match token {
+        TokenSelect::Token1 => TOKEN1,
+        TokenSelect::Token2 => TOKEN2,
+    }
+    .load(deps.storage)?
+    .denom;
+
+    let actual_balance = query_denom_balance(deps, &env, &denom)?;
+    if actual_balance < expected {
+        Err(ContractError::WrongBalance {})
+    } else {
+        Ok(Response::default().add_attribute("method", "assert_balance"))
+    }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
